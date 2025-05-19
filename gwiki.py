@@ -1,297 +1,241 @@
 import os
-import shutil
-from bs4 import BeautifulSoup
+import re
+from pathlib import Path
+from bs4 import BeautifulSoup, Comment
+import logging
 
 # --- Configuration ---
-ZIM_DUMP_OUTPUT_DIR = (
-    "gwiki/"  # Your input directory (e.g., contains 'A', 'I', '-', 'gtitles')
+SOURCE_ARTICLES_DIR = Path("/home/chan/code/wiki/gwiki/A/")
+
+TARGET_CONTENT_A_DIR = Path("/home/chan/code/git/blog/wiki/content/A/")
+
+IMAGE_SRC_PATTERN = re.compile(
+    r"""           # start of string ^
+        (?:\./|\.\./)*  # any ./ or ../ segments
+        /?I/            # the I directory with optional leading slash
+        (?P<path>[^?#]+) # capture the rest of the path up to ? or #
+        (?P<tail>[?#].*)?$   # query-string or fragment if present
+    """,
+    re.VERBOSE,
 )
 
-OUTPUT_DIR = "gwiki_output_big"  # Script will create this
-TARGET_WIKI_SUBDIR = "wiki"  # Content will go into OUTPUT_DIR/TARGET_WIKI_SUBDIR
+# if you copy images to static/wiki/I/ the URL on the live site will be /wiki/I/<file>
+IMAGE_NEW_BASE_URL = "/wiki/I/"
 
-# e.g., gwiki_output/wiki/not_g.html
-NOT_AVAILABLE_PAGE_FILENAME = "not_g.html"
-BROKEN_LINK_INLINE_STYLE_COLOR = "#BF3C2C"  # Wikipedia's typical red link color
+BROKEN_LINK_HREF = "../../not_g.html"
+BROKEN_LINK_STYLE = "color: #BF3C2C;"  # Inline style for broken links
+
+PLACEHOLDER_DATE = "2025-01-01T00:00:00Z"
+
+# --- End Configuration ---
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("wiki_processing.log"),  # Log file
+        logging.StreamHandler(),  # Log to console
+    ],
+)
+
+
+def get_g_article_basenames(source_dir: Path) -> set[str]:
+    """
+    Scans the source directory and returns a set of basenames (filenames without extension)
+    for articles that start with the letter 'G'.
+    """
+    g_articles = set()
+    if not source_dir.is_dir():
+        logging.error(f"Source directory {source_dir} does not exist.")
+        return g_articles
+
+    for item in source_dir.iterdir():
+        if item.is_file() and item.name.startswith("G"):
+            g_articles.add(item.name)  # item.name is the basename like "Galaxy"
+    logging.info(f"Found {len(g_articles)} articles starting with 'G' in {source_dir}")
+    return g_articles
+
+
+def derive_title_from_filename(basename: str) -> str:
+    """
+    Converts a filename-like string to a more readable title.
+    Example: "Gaussian_Distribution" -> "Gaussian Distribution"
+    """
+    return basename.replace("_", " ").strip()
+
+
+def process_article_content(
+    html_content: str, article_basename: str, g_article_basenames: set[str]
+) -> tuple[str | None, str | None]:
+    """
+    Processes the HTML content of a single article:
+    - Extracts or derives the title.
+    - Rewrites image paths.
+    - Rewrites internal links.
+    - Generates Hugo front matter.
+
+    Returns a tuple: (front_matter_string, processed_html_body_string).
+    Returns (None, None) if processing fails.
+    """
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+    except Exception as e:
+        logging.error(f"BeautifulSoup parsing failed for {article_basename}: {e}")
+        return None, None
+
+    # 1. Extract title
+    title_tag = soup.find("title")
+    page_title = ""
+    if title_tag and title_tag.string:
+        page_title = title_tag.string.strip()
+    else:
+        page_title = derive_title_from_filename(article_basename)
+        logging.warning(
+            f"No <title> tag found for {article_basename}. Derived title: '{page_title}'"
+        )
+
+    # Remove existing title tag as Hugo will generate it from front matter
+    if title_tag:
+        title_tag.decompose()
+
+    body_content_html = ""
+    if soup.body:
+        body_content_html = soup.body.decode_contents()  # Get content of body
+        soup = BeautifulSoup(
+            body_content_html, "html.parser"
+        )  # Re-parse to work on body content
+    else:
+        # If no body tag, maybe it's a fragment. Use the whole parsed content.
+        # This might need adjustment based on ZIM export specifics.
+        logging.warning(
+            f"No <body> tag found in {article_basename}. Processing entire HTML content."
+        )
+
+    # 2. Rewrite image paths
+    for img_tag in soup.find_all("img"):
+        original_src = img_tag.get("src")
+        if original_src:
+            match = re.match(r"^(?:\.\./I/|/I/)(.*)", original_src)
+            if match:
+                image_filename = match.group(1)
+                img_tag["src"] = f"{IMAGE_NEW_BASE_URL.rstrip('/')}/{image_filename}"
+            else:
+                logging.warning(
+                    f"Image src '{original_src}' in {article_basename} does not match expected pattern (../I/file or /I/file). Skipping."
+                )
+
+    # 3. Rewrite internal links (<a> tags)
+    for a_tag in soup.find_all("a", href=True):
+        original_href = a_tag["href"]
+
+        href_parts = original_href.split("#", 1)
+        href_base = href_parts[0]
+        href_fragment = f"#{href_parts[1]}" if len(href_parts) > 1 else ""
+
+        target_basename_for_check = href_base
+        if target_basename_for_check.lower().endswith(".html"):
+            target_basename_for_check = target_basename_for_check[:-5]
+
+        if target_basename_for_check in g_article_basenames:
+            # Link to a "G" article, ensure it ends with .html for Hugo file resolution
+            a_tag["href"] = f"{target_basename_for_check}.html{href_fragment}"
+        else:
+            # Link to a non-"G" article (broken link in our context)
+            a_tag["href"] = BROKEN_LINK_HREF
+            # Add or update style
+            current_style = a_tag.get("style", "")
+            if BROKEN_LINK_STYLE not in current_style:  # Avoid duplicate styles
+                a_tag["style"] = (
+                    f"{current_style.rstrip(';')}; {BROKEN_LINK_STYLE}".lstrip("; ")
+                )
+
+    # 4. Create Hugo front matter
+    front_matter = f"""---
+title: "{page_title.replace('"', '\\"')}"
+date: {PLACEHOLDER_DATE}
+outputs: ["html"]
+---
+
+"""
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+
+    return front_matter, str(soup)
 
 
 def main():
-    if not os.path.isdir(ZIM_DUMP_OUTPUT_DIR) or not os.path.exists(
-        os.path.join(ZIM_DUMP_OUTPUT_DIR, "gtitles")
-    ):
-        print(
-            f"ERROR: ZIM_DUMP_OUTPUT_DIR '{ZIM_DUMP_OUTPUT_DIR}' is not a valid directory or 'gtitles' is missing."
-        )
-        print(
-            "Please ensure it points to the extracted ZIM dump folder containing 'A', 'I', '-', 'gtitles'."
-        )
-        return
+    """Main processing function."""
+    logging.info("Starting Wikipedia ZIM dump preprocessing for Hugo.")
 
-    base_output_path = os.path.join(OUTPUT_DIR, TARGET_WIKI_SUBDIR)
-    articles_output_path = os.path.join(base_output_path, "A")
-    images_output_path = os.path.join(base_output_path, "I")
-    styles_output_path = os.path.join(
-        base_output_path, "-"
-    )  # Wikipedia styles often in '-'
-
-    if os.path.exists(OUTPUT_DIR):
-        print(f"Output directory '{OUTPUT_DIR}' already exists. Removing it.")
-        shutil.rmtree(OUTPUT_DIR)
-
-    os.makedirs(articles_output_path, exist_ok=True)
-    os.makedirs(images_output_path, exist_ok=True)
-    os.makedirs(styles_output_path, exist_ok=True)
-
-    print(f"Output structure will be created in: {base_output_path}")
-    print(
-        f"IMPORTANT: You will need to manually create the '{NOT_AVAILABLE_PAGE_FILENAME}' page"
-    )
-    print(
-        f"and place it at: {os.path.join(base_output_path, NOT_AVAILABLE_PAGE_FILENAME)}"
-    )
-
-    # Relative path to the "not available" page from an article located in "A/" directory
-    # e.g., if article is A/MyGArticle.html, path to not_g.html (at wiki/not_g.html) is ../not_g.html
-    relative_path_to_not_available_page = f"../{NOT_AVAILABLE_PAGE_FILENAME}"
-
-    # 3. Identify "G" articles from gtitles
-    gtitles_filepath = os.path.join(ZIM_DUMP_OUTPUT_DIR, "gtitles")
-    all_article_gtitles_entries = []
+    # 1. Ensure target directory exists
     try:
-        with open(gtitles_filepath, "r", encoding="utf-8") as f:
-            all_article_gtitles_entries = [line.strip() for line in f if line.strip()]
-    except FileNotFoundError:
-        print(f"ERROR: gtitles file not found at '{gtitles_filepath}'.")
-        return
-    except Exception as e:
-        print(f"Error reading gtitles file: {e}")
+        TARGET_CONTENT_A_DIR.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Ensured target directory exists: {TARGET_CONTENT_A_DIR}")
+    except OSError as e:
+        logging.error(f"Could not create target directory {TARGET_CONTENT_A_DIR}: {e}")
         return
 
-    if not all_article_gtitles_entries:
-        print("No articles found in gtitles. Exiting.")
-        return
-
-    g_article_basenames = set()  # Store basenames like "Galaxy.html"
-    g_article_source_file_paths = []  # Store full paths to source files
-
-    print(f"\nFiltering articles from '{gtitles_filepath}'...")
-    for article_basename_from_gtitles in all_article_gtitles_entries:
-        # article_basename_from_gtitles is now directly the filename, e.g., "Galaxy.html"
-
-        # Ensure it's not an empty line or some other unexpected entry
-        if not article_basename_from_gtitles or "/" in article_basename_from_gtitles:
-            # print(f"  Skipping potentially invalid gtitles entry: '{article_basename_from_gtitles}'")
-            continue
-
-        current_article_basename = article_basename_from_gtitles
-
-        if current_article_basename.lower().startswith("g"):
-            # Construct the full path to the source HTML file, which is inside the 'A' subdirectory
-            source_html_file = os.path.join(
-                ZIM_DUMP_OUTPUT_DIR, "A", current_article_basename
-            )
-
-            if os.path.exists(source_html_file):
-                g_article_basenames.add(
-                    current_article_basename
-                )  # Store the actual filename
-                g_article_source_file_paths.append(source_html_file)
-            else:
-                # If gtitles has "ArticleName" but file is "ArticleName.html"
-                if not current_article_basename.endswith(".html"):
-                    potential_filename_with_ext = current_article_basename + ".html"
-                    source_html_file_with_ext = os.path.join(
-                        ZIM_DUMP_OUTPUT_DIR, "A", potential_filename_with_ext
-                    )
-                    if os.path.exists(source_html_file_with_ext):
-                        g_article_basenames.add(
-                            potential_filename_with_ext
-                        )  # Store the .html version
-                        g_article_source_file_paths.append(source_html_file_with_ext)
-                    else:
-                        print(
-                            f"  Warning: Article file for '{current_article_basename}' (also tried '{potential_filename_with_ext}') not found in '{os.path.join(ZIM_DUMP_OUTPUT_DIR, 'A')}'."
-                        )
-                else:
-                    print(
-                        f"  Warning: Article file '{current_article_basename}' listed in gtitles not found at '{source_html_file}'."
-                    )
-
+    # 2. Identify all "G" articles from the source directory
+    g_article_basenames = get_g_article_basenames(SOURCE_ARTICLES_DIR)
     if not g_article_basenames:
-        print("No articles starting with 'G' found. Exiting.")
+        logging.warning("No articles starting with 'G' found to process.")
         return
-    print(f"Identified {len(g_article_basenames)} articles starting with 'G'.")
 
-    # 4. Copy and Process "G" Articles
-    print(
-        f"\nCopying and processing {len(g_article_source_file_paths)} 'G' articles to '{articles_output_path}'..."
-    )
-    processed_articles_count = 0
-    for source_article_filepath in g_article_source_file_paths:
-        article_filename = os.path.basename(source_article_filepath)
+    processed_count = 0
+    error_count = 0
 
-        if not article_filename.endswith(
-            (".html", ".htm")
-        ):  # Check if it already has an html-like extension
-            article_filename_html = article_filename + ".html"
-        else:
-            article_filename_html = article_filename
-        dest_article_filepath = os.path.join(
-            articles_output_path, article_filename_html
-        )
+    # 3. Process each "G" article
+    for article_basename in g_article_basenames:
+        source_filepath = SOURCE_ARTICLES_DIR / article_basename
+        # Hugo expects content files with extensions, e.g., .html or .md
+        target_filename = f"{article_basename}.html"
+        target_filepath = TARGET_CONTENT_A_DIR / target_filename
+
+        logging.info(f"Processing: {article_basename} -> {target_filepath}")
 
         try:
-            shutil.copy2(source_article_filepath, dest_article_filepath)
+            # Read source article content
+            with open(source_filepath, "r", encoding="utf-8") as f:
+                html_content = f.read()
 
-            with open(dest_article_filepath, "r+", encoding="utf-8") as f:
-                content = f.read()
-                # Only try to parse and modify if it's likely HTML (basic check)
-                if not content.strip().lower().startswith(
-                    "<!doctype html"
-                ) and not content.strip().lower().startswith("<html"):
-                    # print(f"  Skipping link processing for non-standard HTML start: {article_filename}")
-                    processed_articles_count += 1
-                    continue  # Skip further processing for this file if not clearly HTML
+            # Process the content
+            front_matter, processed_html_body = process_article_content(
+                html_content, article_basename, g_article_basenames
+            )
 
-                soup = BeautifulSoup(content, "lxml")
-
-                links_modified_count = 0
-                # Process <a> links
-                for a_tag in soup.find_all("a", href=True):
-                    href = a_tag["href"]
-                    original_href = href
-
-                    if (
-                        href.startswith(
-                            ("http:", "https:", "ftp:", "mailto:", "//", "#")
-                        )
-                        or href.startswith(("../I/", "/I/", "I/", "../-/", "/-/", "-/"))
-                        or href.lower().endswith(
-                            (
-                                ".png",
-                                ".jpg",
-                                ".jpeg",
-                                ".gif",
-                                ".svg",
-                                ".css",
-                                ".js",
-                                ".ico",
-                            )
-                        )
-                    ):
-                        continue
-
-                    href_check_part = href.split("#")[0].split("?")[0]
-
-                    if "/" in href_check_part:
-                        continue
-
-                    target_article_basename = href_check_part
-                    if target_article_basename not in g_article_basenames:
-                        a_tag["href"] = relative_path_to_not_available_page
-                        links_modified_count += 1
-
-                        # Apply inline style for the color
-                        our_color_style_declaration = (
-                            f"color: {BROKEN_LINK_INLINE_STYLE_COLOR}"
-                        )
-
-                        existing_style_str = a_tag.get("style", "")
-
-                        # Parse existing styles: split by ';', filter out existing 'color:'
-                        style_properties = [
-                            prop.strip()
-                            for prop in existing_style_str.split(";")
-                            if prop.strip()
-                        ]
-                        other_styles = [
-                            prop
-                            for prop in style_properties
-                            if not prop.lower().startswith("color:")
-                        ]
-
-                        # Add our new color style
-                        final_styles_list = other_styles + [our_color_style_declaration]
-
-                        # Join them back, ensuring semicolons correctly
-                        new_style_str = "; ".join(s for s in final_styles_list if s)
-                        if (
-                            new_style_str
-                        ):  # Add trailing semicolon only if there's content
-                            new_style_str += ";"
-
-                        a_tag["style"] = new_style_str
-                # Process <meta http-equiv="refresh"> redirects (Optional Enhancement)
-                # for meta_tag in soup.find_all("meta", attrs={"http-equiv": "refresh"}):
-                #    content_attr = meta_tag.get("content")
-                #    if content_attr:
-                #        parts = content_attr.split("url=")
-                #        if len(parts) > 1:
-                #            redirect_url = parts[1].strip()
-                #            redirect_target_basename = redirect_url.split("#")[0].split("?")[0]
-                #            if "/" not in redirect_target_basename and redirect_target_basename not in g_article_basenames:
-                #                meta_tag["content"] = f"{parts[0]}url={relative_path_to_not_available_page}"
-                #                links_modified_count += 1 # Or a different counter
-
-                if links_modified_count > 0:
-                    f.seek(0)
-                    f.write(str(soup))
-                    f.truncate()
-
-            processed_articles_count += 1
-            if processed_articles_count % 100 == 0 or processed_articles_count == len(
-                g_article_source_file_paths
-            ):
-                print(
-                    f"  Processed {processed_articles_count}/{len(g_article_source_file_paths)} articles..."
+            if front_matter is None or processed_html_body is None:
+                logging.error(
+                    f"Skipping article {article_basename} due to processing error."
                 )
+                error_count += 1
+                continue
+
+            # Write the new file with front matter and processed HTML
+            with open(target_filepath, "w", encoding="utf-8") as f:
+                f.write(front_matter)
+                f.write(processed_html_body)
+
+            processed_count += 1
 
         except FileNotFoundError:
-            print(
-                f"  ERROR: Source file not found during copy: {source_article_filepath}"
-            )
+            logging.error(f"Source file not found: {source_filepath}")
+            error_count += 1
+        except IOError as e:
+            logging.error(f"IOError processing file {source_filepath}: {e}")
+            error_count += 1
         except Exception as e:
-            print(
-                f"  ERROR processing file {article_filename} (from {source_article_filepath}): {e}"
+            logging.error(
+                f"An unexpected error occurred while processing {article_basename}: {e}"
             )
+            error_count += 1
 
-    print(f"Finished processing {processed_articles_count} articles.")
-
-    # 5. Copy Styles directory (-) and Images directory (I)
-    print("\nCopying styles and images...")
-
-    source_styles_dir = os.path.join(ZIM_DUMP_OUTPUT_DIR, "-")
-    if os.path.exists(source_styles_dir):
-        print(f"Copying styles from '{source_styles_dir}' to '{styles_output_path}'")
-        shutil.copytree(source_styles_dir, styles_output_path, dirs_exist_ok=True)
-    else:
-        print(
-            f"Warning: Styles directory '-' not found at '{source_styles_dir}'. Styling might be incomplete."
-        )
-
-    source_images_dir = os.path.join(ZIM_DUMP_OUTPUT_DIR, "I")
-    if os.path.exists(source_images_dir):
-        print(f"Copying images from '{source_images_dir}' to '{images_output_path}'")
-        shutil.copytree(source_images_dir, images_output_path, dirs_exist_ok=True)
-    else:
-        print(
-            f"Warning: Images directory 'I' not found at '{source_images_dir}'. Images will be missing."
-        )
-
-    print(f"\n--- Processing Complete ---")
-    print(f"Subset Wikipedia for 'G' articles is located in: {base_output_path}")
-    print(
-        f"This entire '{TARGET_WIKI_SUBDIR}' directory (inside '{OUTPUT_DIR}') can now be copied into your HUGO 'static' directory."
-    )
-    print(f'  Example: cp -r "{base_output_path}" "/path/to/your/hugo_project/static/"')
-    print(
-        f"Make sure you manually create '{NOT_AVAILABLE_PAGE_FILENAME}' at '{os.path.join(base_output_path, NOT_AVAILABLE_PAGE_FILENAME)}'"
-    )
-    print(
-        f"Access point would be your_site.com/{TARGET_WIKI_SUBDIR}/A/Article_Name.html"
-    )
-    print(
-        f"Non-'G' article links should point to: your_site.com/{TARGET_WIKI_SUBDIR}/{NOT_AVAILABLE_PAGE_FILENAME}"
+    logging.info("--- Processing Complete ---")
+    logging.info(f"Successfully processed: {processed_count} articles.")
+    logging.info(f"Failed/skipped articles: {error_count} articles.")
+    logging.info(f"Processed articles are in: {TARGET_CONTENT_A_DIR}")
+    logging.info(
+        f"A log file 'wiki_processing.log' has been created in the script's directory."
     )
 
 
