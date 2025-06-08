@@ -11,8 +11,7 @@ DATA_FILE = "wikidump/enwiki-20250601-pages-articles-multistream.xml.bz2"
 OUTPUT_DIR = "./data/"
 
 ##Test Config
-# INDEX_FILE = "testinput/enwiki-20250601-pages-articles-multistream-index1.txt-p1p41242.bz2"
-# DATA_FILE = "testinput/enwiki-20250601-pages-articles-multistream.xml-p1p41242.bz2"
+# DATA_FILE = "testinput/enwiki-20250601-pages-articles-multistream1.xml-p1p41242.bz2"
 # OUTPUT_DIR = "./data_test/"
 
 
@@ -55,7 +54,6 @@ def extract_articles():
     # 2. Extract, Parse, and Save the Articles from the main dump
     print(f"Starting extraction from {DATA_FILE}...")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
     extracted_count = 0
     total_titles = sum(len(titles) for titles in offsets_to_titles.values())
 
@@ -67,14 +65,24 @@ def extract_articles():
             pbar.set_description(f"Seeking to offset {offset}")
 
             bz2_file.seek(offset)
-
-            ## Decompresss one block at a time, with many decompressers at once
             decompressor = bz2.BZ2Decompressor()
-            xml_data = decompressor.decompress(bz2_file.read())
 
-            # The decompressed data is an XML fragment. We wrap it in a dummy
-            # <root> tag so lxml can parse it as a valid XML document.
-            xml_root = etree.fromstring(b"<root>" + xml_data + b"</root>")
+            ## Attempt at reading part by part to save memory
+            xml_data = b""
+            CHUNK_SIZE = 64 * 1024 * 1024  # Process 1MB of compressed data at a time
+            while not decompressor.eof:
+                chunk = bz2_file.read(CHUNK_SIZE)
+                if not chunk:
+                    # Should not happen in a valid multistream file unless it's the very end
+                    break
+                xml_data += decompressor.decompress(chunk)
+
+            # Wrap the decompressed XML fragment to make it parsable
+            try:
+                xml_root = etree.fromstring(b"<root>" + xml_data + b"</root>")
+            except etree.XMLSyntaxError:
+                pbar.set_postfix_str(f"Skipping malformed XML block at offset {offset}")
+                continue  # Skip to the next offset if the block is broken
 
             for page in xml_root.findall("page"):
                 title = page.findtext("title")
