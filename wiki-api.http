@@ -1,0 +1,52 @@
+@loginUrl = https://auth.enterprise.wikimedia.com
+@apiUrl = https://api.enterprise.wikimedia.com
+
+### login
+POST {{loginUrl}}/v1/login
+Content-Type: application/json
+
+{
+  "username": "{{USERNAME}}",
+  "password": "{{PASSWORD}}"
+}
+
+### Get Projects
+POST {{apiUrl}}/v2/projects
+Accept: application/json
+Authorization: Bearer {{login.response.body.$.access_token}}
+
+{
+  "filters": "[{\"field\":\"in_language.identifier\",\"value\":\"en\"}]"
+}
+
+### Get Projects (filtered for English)
+GET {{apiUrl}}/v2/projects?filter[in_language.identifier]=en
+Accept: application/json
+Authorization: Bearer {{login.response.body.$.access_token}}
+
+
+### Get NASA Article
+POST {{apiUrl}}/v2/articles/NASA
+Accept: application/json
+Authorization: Bearer {{login.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "filters": [
+    {
+      "field": "is_part_of.identifier",
+      "value": "enwiki"
+    }
+  ],
+  "limit": 1
+}
+
+### Download Snapshot (this will download the file)
+GET {{apiUrl}}/v2/snapshots/enwiki_namespace_0/download
+Accept: application/json
+Authorization: Bearer {{login.response.body.$.access_token}}
+
+### Get namespace
+GET https://api.enterprise.wikimedia.com/v2/namespaces
+Accept: application/json
+Authorization: Bearer {{login.response.body.$.access_token}}
