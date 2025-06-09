@@ -1,0 +1,14 @@
+.env
+.env.*
+.venv
+*.llamaindex
+gtitles*
+*.index
+*.txt
+enwiki*
+*.bak
+data_g_articles/
+data_test/
+data/
+wikidump/
+download/
