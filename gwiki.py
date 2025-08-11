@@ -2,18 +2,20 @@
 """
 Optimized Wikipedia article extractor from ZIM files.
 Fast, efficient, with redirect and image handling.
+Combines memory mapping with working content extraction approach.
 """
 
 import argparse
 import json
 import logging
 import time
-import io
+import re
 from pathlib import Path
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from threading import Lock
+from functools import lru_cache
 
 try:
     from libzim.reader import Archive
@@ -21,9 +23,9 @@ except ImportError:
     raise ImportError("libzim is required. Install with: pip install libzim")
 
 # Configuration
-TARGET_DIR = Path("/home/chan/code/wiki/test/A/")
-TARGET_IMAGES_DIR = Path("/home/chan/code/wiki/test/I/")
-TITLES_FILE = Path("/home/chan/code/wiki/gtitles.txt")
+TARGET_DIR = Path("/home/chan/code/wiki/giki/test/A/")
+TARGET_IMAGES_DIR = Path("/home/chan/code/wiki/giki/test/I/")
+TITLES_FILE = Path("/home/chan/code/wiki/giki/gtitles.txt")
 BROKEN_LINK_REPLACEMENT = '<a href="../wiki/not_g.html" class="not_g"'
 
 
@@ -59,6 +61,22 @@ class ProcessingStats:
                 self.images.update(images)
 
 
+class RegexCache:
+    """Pre-compiled regex patterns for better performance."""
+
+    def __init__(self):
+        self.img_pattern = re.compile(
+            r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>', re.IGNORECASE
+        )
+        self.link_pattern = re.compile(
+            r'<a\s+([^>]*?)href=["\']([^"\']*)["\']([^>]*?)>', re.IGNORECASE | re.DOTALL
+        )
+
+
+# Global regex cache
+REGEX_CACHE = RegexCache()
+
+
 def setup_logging(verbose: bool = False):
     """Configure logging."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -91,190 +109,187 @@ def get_existing_files(target_dir: Path) -> Set[str]:
 
 
 def extract_images_from_html(html: str) -> Set[str]:
-    """Extract image filenames from HTML using simple string operations."""
+    """Extract image filenames from HTML using regex."""
     images = set()
-    pos = 0
+    matches = REGEX_CACHE.img_pattern.findall(html)
 
-    while True:
-        img_start = html.find("<img", pos)
-        if img_start == -1:
-            break
-
-        src_start = html.find('src="', img_start)
-        if src_start == -1:
-            pos = img_start + 4
-            continue
-
-        src_start += 5
-        src_end = html.find('"', src_start)
-        if src_end == -1:
-            pos = img_start + 4
-            continue
-
-        src = html[src_start:src_end]
+    for src in matches:
+        # Extract just the filename
         if "/" in src:
             filename = src.split("/")[-1]
-            if filename:
-                images.add(filename)
+        else:
+            filename = src
 
-        pos = src_end
+        if filename and not filename.startswith("data:"):
+            images.add(filename)
 
     return images
 
 
 def fix_links_fast(html: str, valid_articles: Set[str]) -> str:
-    """Fix Wikipedia links - valid ones get .html, invalid ones get broken link replacement."""
-    result = io.StringIO()
-    pos = 0
+    """Fix Wikipedia links using regex."""
 
-    while True:
-        link_start = html.find("<a ", pos)
-        if link_start == -1:
-            result.write(html[pos:])
-            break
+    def replace_link(match):
+        """Replacement function for each link."""
+        pre_href = match.group(1) if match.group(1) else ""
+        href = match.group(2)
+        post_href = match.group(3) if match.group(3) else ""
 
-        result.write(html[pos:link_start])
+        # Skip empty hrefs, anchors, and external links
+        if not href or href.startswith("#") or href.startswith("http"):
+            return match.group(0)
 
-        tag_end = html.find(">", link_start)
-        if tag_end == -1:
-            result.write(html[link_start:])
-            break
+        # Store original href and anchor
+        original_href = href
+        anchor = ""
 
-        full_tag = html[link_start : tag_end + 1]
+        # Extract anchor if present
+        if "#" in href:
+            href_parts = href.split("#", 1)
+            href = href_parts[0]
+            anchor = "#" + href_parts[1]
 
-        href_start = full_tag.find('href="')
-        if href_start == -1:
-            result.write(full_tag)
-            pos = tag_end + 1
-            continue
-
-        href_start += 6
-        href_end = full_tag.find('"', href_start)
-        if href_end == -1:
-            result.write(full_tag)
-            pos = tag_end + 1
-            continue
-
-        href = full_tag[href_start:href_end]
-
-        # Extract article title from various link formats
+        # Determine if this is a wiki link and extract the article title
         article_title = None
         is_wiki_link = False
 
-        if href.startswith("A/"):
+        # Remove various prefixes to get the clean article title
+        if href.startswith("./"):
             is_wiki_link = True
             article_title = href[2:]
-        elif href.startswith("../A/"):
+        elif href.startswith("../"):
+            remaining = href[3:]
+            if remaining.startswith("A/"):
+                is_wiki_link = True
+                article_title = remaining[2:]
+            elif remaining.startswith("wiki/"):
+                is_wiki_link = True
+                article_title = remaining[5:]
+            else:
+                # Could be ../something_else
+                is_wiki_link = False
+        elif href.startswith("A/"):
             is_wiki_link = True
-            article_title = href[5:]
+            article_title = href[2:]
         elif href.startswith("/wiki/"):
             is_wiki_link = True
             article_title = href[6:]
-        elif href.startswith("../wiki/"):
+        elif not "/" in href or href.count("/") == 0:
+            # Plain article name without path
             is_wiki_link = True
-            article_title = href[8:]
+            article_title = href
 
         if is_wiki_link and article_title:
-            # Remove .html extension if present
+            # Clean up article title
             if article_title.endswith(".html"):
                 article_title = article_title[:-5]
 
-            # Remove anchor/fragment if present
-            if "#" in article_title:
-                article_title = article_title.split("#")[0]
-
-            # Now check if this article is in our valid set
+            # Check if this article is in our valid set
             if article_title in valid_articles:
-                # Valid article - ensure it has .html extension
-                if not href.endswith(".html") and "#" not in href:
-                    fixed_href = href + ".html"
-                    fixed_tag = full_tag.replace(
-                        f'href="{href}"', f'href="{fixed_href}"'
-                    )
-                    result.write(fixed_tag)
-                else:
-                    result.write(full_tag)
+                # Valid article - ensure proper path format
+                new_href = f"../A/{article_title}.html{anchor}"
+                return f'<a {pre_href}href="{new_href}"{post_href}>'
             else:
                 # Invalid article - replace with not_g.html link
-                # Extract any additional attributes from the original tag
-                # but replace the href and add the not_g class
+                # Check for existing class attribute
+                full_attrs = pre_href + " " + post_href
 
-                # Find where to insert the class
-                class_start = full_tag.find('class="')
-                if class_start != -1:
-                    # Add not_g to existing classes
-                    class_end = full_tag.find('"', class_start + 7)
-                    existing_classes = full_tag[class_start + 7 : class_end]
-                    new_tag = (
-                        full_tag[: class_start + 7]
-                        + existing_classes
-                        + " not_g"
-                        + full_tag[class_end:]
-                    )
-                    # Replace the href
-                    new_tag = new_tag.replace(
-                        f'href="{href}"', 'href="../wiki/not_g.html"'
-                    )
-                    result.write(new_tag)
+                if 'class="' in full_attrs:
+                    # Find and update existing class
+                    class_match = re.search(r'class="([^"]*)"', full_attrs)
+                    if class_match:
+                        existing_classes = class_match.group(1)
+                        if "not_g" not in existing_classes:
+                            new_classes = f"{existing_classes} not_g"
+                            # Replace class in the appropriate part
+                            if 'class="' in post_href:
+                                new_post_href = post_href.replace(
+                                    f'class="{existing_classes}"',
+                                    f'class="{new_classes}"',
+                                )
+                                return f'<a {pre_href}href="../wiki/not_g.html"{new_post_href}>'
+                            else:
+                                new_pre_href = pre_href.replace(
+                                    f'class="{existing_classes}"',
+                                    f'class="{new_classes}"',
+                                )
+                                return f'<a {new_pre_href}href="../wiki/not_g.html"{post_href}>'
+                    return f'<a {pre_href}href="../wiki/not_g.html"{post_href}>'
                 else:
                     # No existing class, add our own
-                    # Replace href and add class
-                    new_tag = '<a href="../wiki/not_g.html" class="not_g"'
+                    return f'<a {pre_href}href="../wiki/not_g.html" class="not_g"{post_href}>'
 
-                    # Copy any other attributes (except href)
-                    tag_content = full_tag[3:-1]  # Remove "<a " and ">"
-                    parts = tag_content.split()
+        # Not a wiki link, return as is
+        return match.group(0)
 
-                    for part in parts:
-                        if not part.startswith("href="):
-                            # This is a simplification - proper attribute parsing would be better
-                            # but this should work for most cases
-                            if "=" in part and not part.startswith("class="):
-                                new_tag += " " + part
-
-                    new_tag += ">"
-                    result.write(new_tag)
-        else:
-            # Not a wiki link, leave as is
-            result.write(full_tag)
-
-        pos = tag_end + 1
-
-    return result.getvalue()
+    return REGEX_CACHE.link_pattern.sub(replace_link, html)
 
 
-def process_article(archive: Archive, title: str, valid_articles: Set[str]) -> tuple:
+def process_article(
+    archive: Archive, title: str, valid_articles: Set[str], verbose_debug: bool = False
+) -> Tuple[bool, bool, Set[str]]:
     """Process a single article. Returns (success, is_redirect, images_set)."""
-    try:
-        entry = archive.get_entry_by_path(f"A/{title}")
+    zim_path = f"A/{title}"
 
+    try:
+        # Try to get the entry directly by path
+        entry = archive.get_entry_by_path(zim_path)
+
+        # Check if it's a redirect
         if entry.is_redirect:
-            redirect_target = entry.get_redirect_entry().path
-            redirect_html = f'''<!DOCTYPE html>
+            redirect_entry = entry.get_redirect_entry()
+            redirect_target = redirect_entry.path if redirect_entry else "Main_Page"
+
+            # Clean up redirect target
+            if redirect_target.startswith("A/"):
+                redirect_target = redirect_target[2:]
+
+            redirect_html = f"""<!DOCTYPE html>
 <html><head>
-<meta http-equiv="refresh" content="0; url={redirect_target}.html">
+<meta http-equiv="refresh" content="0; url=../A/{redirect_target}.html">
 <title>Redirect</title>
 </head><body>
-<p>Redirecting to <a href="{redirect_target}.html">{redirect_target}</a></p>
-</body></html>'''
+<p>Redirecting to <a href="../A/{redirect_target}.html">{redirect_target}</a></p>
+</body></html>"""
 
             output_path = TARGET_DIR / f"{title}.html"
             output_path.write_text(redirect_html, encoding="utf-8")
+
+            if verbose_debug:
+                logging.debug(f"Created redirect: {title} -> {redirect_target}")
+
             return (True, True, set())
 
-        else:
-            content = bytes(entry.get_item().content)
-            html = content.decode("utf-8", errors="ignore")
+        # Get content for non-redirect entry
+        content = bytes(entry.get_item().content)
+        html = content.decode("utf-8", errors="ignore")
 
-            images = extract_images_from_html(html)
-            fixed_html = fix_links_fast(html, valid_articles)
+        if verbose_debug:
+            logging.debug(f"Processing article: {title} (size: {len(html)} bytes)")
+            if len(html) > 500:
+                logging.debug(f"First 500 chars of HTML: {html[:500]}")
 
-            output_path = TARGET_DIR / f"{title}.html"
-            output_path.write_text(fixed_html, encoding="utf-8")
-            return (True, False, images)
+        # Extract images
+        images = extract_images_from_html(html)
+        if images and verbose_debug:
+            logging.debug(f"Found {len(images)} images in {title}")
+
+        # Fix links
+        fixed_html = fix_links_fast(html, valid_articles)
+
+        # Write the processed article
+        output_path = TARGET_DIR / f"{title}.html"
+        output_path.write_text(fixed_html, encoding="utf-8")
+
+        if verbose_debug:
+            logging.debug(f"Successfully processed article: {title}")
+
+        return (True, False, images)
 
     except Exception as e:
-        logging.debug(f"Error processing {title}: {e}")
+        error_msg = str(e)
+        if verbose_debug or ("not found" not in error_msg.lower()):
+            logging.debug(f"Error processing {title}: {error_msg}")
         return (False, False, set())
 
 
@@ -283,13 +298,14 @@ def process_batch_worker(
     titles_batch: List[str],
     valid_articles: Set[str],
     stats: ProcessingStats,
+    worker_id: int = 0,
 ):
     """Worker function that processes a batch with its own Archive instance."""
-    # Each worker creates its own Archive instance - no sharing needed
+    # Each worker creates its own Archive instance
     try:
-        archive = Archive(zim_path)
+        archive = Archive(str(zim_path))
     except Exception as e:
-        logging.error(f"Failed to open archive: {e}")
+        logging.error(f"Worker {worker_id} failed to open archive: {e}")
         stats.update(errors=len(titles_batch))
         return
 
@@ -298,8 +314,15 @@ def process_batch_worker(
     batch_errors = 0
     batch_images = set()
 
-    for title in titles_batch:
-        success, is_redirect, images = process_article(archive, title, valid_articles)
+    # Enable verbose debug for first article of first worker
+    first_article_debug = worker_id == 0
+
+    for i, title in enumerate(titles_batch):
+        verbose_debug = first_article_debug and i == 0
+        success, is_redirect, images = process_article(
+            archive, title, valid_articles, verbose_debug
+        )
+
         if success:
             if is_redirect:
                 batch_redirects += 1
@@ -340,10 +363,34 @@ def process_articles(
     # Convert to set for O(1) lookup
     valid_articles = set(titles)
 
+    # Test with first article to ensure everything works
+    if titles_to_process:
+        logging.info(f"Testing with first article: {titles_to_process[0]}")
+        test_archive = Archive(str(zim_path))
+        success, is_redirect, images = process_article(
+            test_archive, titles_to_process[0], valid_articles, verbose_debug=True
+        )
+        if success:
+            if is_redirect:
+                logging.info("First article is a redirect")
+                stats.update(redirects=1)
+            else:
+                logging.info(
+                    f"First article processed successfully with {len(images)} images"
+                )
+                stats.update(successful=1, images=images)
+            titles_to_process = titles_to_process[1:]
+        else:
+            logging.warning("First article failed to process")
+            stats.update(errors=1)
+            titles_to_process = titles_to_process[1:]
+
+    if not titles_to_process:
+        return stats
+
     # Calculate optimal batch size
-    # Smaller batches = better progress reporting, larger = less overhead
     batch_size = max(100, len(titles_to_process) // (max_workers * 10))
-    batch_size = min(batch_size, 500)  # Cap at 500 to maintain responsiveness
+    batch_size = min(batch_size, 500)
 
     batches = [
         titles_to_process[i : i + batch_size]
@@ -351,7 +398,8 @@ def process_articles(
     ]
 
     logging.info(
-        f"Processing {len(titles_to_process):,} articles in {len(batches)} batches of ~{batch_size} items using {max_workers} workers"
+        f"Processing {len(titles_to_process):,} articles in {len(batches)} batches "
+        f"of ~{batch_size} items using {max_workers} workers"
     )
 
     start_time = time.time()
@@ -361,9 +409,9 @@ def process_articles(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
-                process_batch_worker, zim_path, batch, valid_articles, stats
+                process_batch_worker, zim_path, batch, valid_articles, stats, i
             )
-            for batch in batches
+            for i, batch in enumerate(batches)
         ]
 
         completed = 0
@@ -413,7 +461,7 @@ def extract_images(zim_path: Path, image_names: Set[str], max_workers: int = 32)
     def extract_batch(image_batch):
         """Extract a batch of images with its own Archive instance."""
         try:
-            archive = Archive(zim_path)
+            archive = Archive(str(zim_path))
         except Exception as e:
             logging.error(f"Failed to open archive for image extraction: {e}")
             return 0
@@ -422,9 +470,10 @@ def extract_images(zim_path: Path, image_names: Set[str], max_workers: int = 32)
         for image_name in image_batch:
             try:
                 entry = archive.get_entry_by_path(f"I/{image_name}")
+                content = bytes(entry.get_item().content)
+
                 output_path = TARGET_IMAGES_DIR / image_name
                 if not output_path.exists():
-                    content = bytes(entry.get_item().content)
                     output_path.write_bytes(content)
                     extracted += 1
             except Exception:
@@ -476,7 +525,10 @@ def main():
         help="File with article titles (one per line)",
     )
     parser.add_argument(
-        "--workers", type=int, default=32, help="Number of worker threads (default: 32)"
+        "--workers",
+        type=int,
+        default=32,
+        help="Number of worker threads (default: 32)",
     )
     parser.add_argument(
         "--extract-images",
@@ -519,7 +571,9 @@ def main():
     # Process articles
     logging.info(f"Processing articles from {args.zim_file}")
     start_time = time.time()
+
     stats = process_articles(args.zim_file, titles, max_workers=args.workers)
+
     total_time = time.time() - start_time
 
     # Save image list
