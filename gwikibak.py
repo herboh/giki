@@ -8,12 +8,10 @@ import argparse
 import json
 import logging
 import time
-import io
 from pathlib import Path
-from typing import List, Set, Optional
+from typing import List, Set, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from threading import Lock
 
 try:
     from libzim.reader import Archive
@@ -21,8 +19,8 @@ except ImportError:
     raise ImportError("libzim is required. Install with: pip install libzim")
 
 # Configuration
-TARGET_DIR = Path("/home/chan/code/wiki/test/A/")
-TARGET_IMAGES_DIR = Path("/home/chan/code/wiki/test/I/")
+TARGET_DIR = Path("/home/chan/code/wiki/A/")
+TARGET_IMAGES_DIR = Path("/home/chan/code/wiki/I/")
 TITLES_FILE = Path("/home/chan/code/wiki/gtitles.txt")
 BROKEN_LINK_REPLACEMENT = '<a href="../wiki/not_g.html" class="not_g"'
 
@@ -37,26 +35,10 @@ class ProcessingStats:
     errors: int = 0
     already_existed: int = 0
     images: Set[str] = field(default_factory=set)
-    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     @property
     def total_processed(self):
         return self.successful + self.redirects + self.errors
-
-    def update(
-        self,
-        successful: int = 0,
-        redirects: int = 0,
-        errors: int = 0,
-        images: Optional[Set[str]] = None,
-    ):
-        """Thread-safe update of stats."""
-        with self._lock:
-            self.successful += successful
-            self.redirects += redirects
-            self.errors += errors
-            if images:
-                self.images.update(images)
 
 
 def setup_logging(verbose: bool = False):
@@ -96,22 +78,26 @@ def extract_images_from_html(html: str) -> Set[str]:
     pos = 0
 
     while True:
+        # Find next img tag
         img_start = html.find("<img", pos)
         if img_start == -1:
             break
 
+        # Find src attribute
         src_start = html.find('src="', img_start)
         if src_start == -1:
             pos = img_start + 4
             continue
 
-        src_start += 5
+        src_start += 5  # Skip 'src="'
         src_end = html.find('"', src_start)
         if src_end == -1:
             pos = img_start + 4
             continue
 
         src = html[src_start:src_end]
+
+        # Extract filename
         if "/" in src:
             filename = src.split("/")[-1]
             if filename:
@@ -124,123 +110,78 @@ def extract_images_from_html(html: str) -> Set[str]:
 
 def fix_links_fast(html: str, valid_articles: Set[str]) -> str:
     """Fix Wikipedia links - valid ones get .html, invalid ones get broken link replacement."""
-    result = io.StringIO()
+    result = []
     pos = 0
 
     while True:
+        # Find next <a tag
         link_start = html.find("<a ", pos)
         if link_start == -1:
-            result.write(html[pos:])
+            result.append(html[pos:])
             break
 
-        result.write(html[pos:link_start])
+        # Append HTML before this link
+        result.append(html[pos:link_start])
 
+        # Find end of opening tag
         tag_end = html.find(">", link_start)
         if tag_end == -1:
-            result.write(html[link_start:])
+            result.append(html[link_start:])
             break
 
+        # Extract the full tag
         full_tag = html[link_start : tag_end + 1]
 
+        # Find href attribute
         href_start = full_tag.find('href="')
         if href_start == -1:
-            result.write(full_tag)
+            result.append(full_tag)
             pos = tag_end + 1
             continue
 
-        href_start += 6
+        href_start += 6  # Skip 'href="'
         href_end = full_tag.find('"', href_start)
         if href_end == -1:
-            result.write(full_tag)
+            result.append(full_tag)
             pos = tag_end + 1
             continue
 
         href = full_tag[href_start:href_end]
 
-        # Extract article title from various link formats
+        # Check if this is a Wikipedia article link
         article_title = None
-        is_wiki_link = False
-
         if href.startswith("A/"):
-            is_wiki_link = True
-            article_title = href[2:]
+            article_title = href[2:].split("#")[0]
         elif href.startswith("../A/"):
-            is_wiki_link = True
-            article_title = href[5:]
-        elif href.startswith("/wiki/"):
-            is_wiki_link = True
-            article_title = href[6:]
-        elif href.startswith("../wiki/"):
-            is_wiki_link = True
-            article_title = href[8:]
+            article_title = href[5:].split("#")[0]
 
-        if is_wiki_link and article_title:
-            # Remove .html extension if present
-            if article_title.endswith(".html"):
-                article_title = article_title[:-5]
-
-            # Remove anchor/fragment if present
-            if "#" in article_title:
-                article_title = article_title.split("#")[0]
-
-            # Now check if this article is in our valid set
+        if article_title:
+            # This is a Wikipedia link
             if article_title in valid_articles:
-                # Valid article - ensure it has .html extension
+                # Valid link - add .html if not already there
                 if not href.endswith(".html") and "#" not in href:
                     fixed_href = href + ".html"
                     fixed_tag = full_tag.replace(
                         f'href="{href}"', f'href="{fixed_href}"'
                     )
-                    result.write(fixed_tag)
+                    result.append(fixed_tag)
                 else:
-                    result.write(full_tag)
+                    result.append(full_tag)
             else:
-                # Invalid article - replace with not_g.html link
-                # Extract any additional attributes from the original tag
-                # but replace the href and add the not_g class
-
-                # Find where to insert the class
-                class_start = full_tag.find('class="')
-                if class_start != -1:
-                    # Add not_g to existing classes
-                    class_end = full_tag.find('"', class_start + 7)
-                    existing_classes = full_tag[class_start + 7 : class_end]
-                    new_tag = (
-                        full_tag[: class_start + 7]
-                        + existing_classes
-                        + " not_g"
-                        + full_tag[class_end:]
-                    )
-                    # Replace the href
-                    new_tag = new_tag.replace(
-                        f'href="{href}"', 'href="../wiki/not_g.html"'
-                    )
-                    result.write(new_tag)
+                # Invalid link - replace with broken link
+                space_pos = full_tag.find(" ", 3)  # Skip '<a '
+                if space_pos != -1:
+                    rest_of_tag = full_tag[space_pos:]
+                    result.append(BROKEN_LINK_REPLACEMENT + rest_of_tag)
                 else:
-                    # No existing class, add our own
-                    # Replace href and add class
-                    new_tag = '<a href="../wiki/not_g.html" class="not_g"'
-
-                    # Copy any other attributes (except href)
-                    tag_content = full_tag[3:-1]  # Remove "<a " and ">"
-                    parts = tag_content.split()
-
-                    for part in parts:
-                        if not part.startswith("href="):
-                            # This is a simplification - proper attribute parsing would be better
-                            # but this should work for most cases
-                            if "=" in part and not part.startswith("class="):
-                                new_tag += " " + part
-
-                    new_tag += ">"
-                    result.write(new_tag)
+                    result.append(BROKEN_LINK_REPLACEMENT + ">")
         else:
-            # Not a wiki link, leave as is
-            result.write(full_tag)
+            # Not a Wikipedia link, keep as-is
+            result.append(full_tag)
 
         pos = tag_end + 1
 
-    return result.getvalue()
+    return "".join(result)
 
 
 def process_article(archive: Archive, title: str, valid_articles: Set[str]) -> tuple:
@@ -249,6 +190,7 @@ def process_article(archive: Archive, title: str, valid_articles: Set[str]) -> t
         entry = archive.get_entry_by_path(f"A/{title}")
 
         if entry.is_redirect:
+            # Handle redirect
             redirect_target = entry.get_redirect_entry().path
             redirect_html = f'''<!DOCTYPE html>
 <html><head>
@@ -263,12 +205,17 @@ def process_article(archive: Archive, title: str, valid_articles: Set[str]) -> t
             return (True, True, set())
 
         else:
+            # Regular article
             content = bytes(entry.get_item().content)
             html = content.decode("utf-8", errors="ignore")
 
+            # Extract images
             images = extract_images_from_html(html)
+
+            # Fix links
             fixed_html = fix_links_fast(html, valid_articles)
 
+            # Write file
             output_path = TARGET_DIR / f"{title}.html"
             output_path.write_text(fixed_html, encoding="utf-8")
             return (True, False, images)
@@ -278,44 +225,25 @@ def process_article(archive: Archive, title: str, valid_articles: Set[str]) -> t
         return (False, False, set())
 
 
-def process_batch_worker(
-    zim_path: Path,
-    titles_batch: List[str],
-    valid_articles: Set[str],
-    stats: ProcessingStats,
-):
-    """Worker function that processes a batch with its own Archive instance."""
-    # Each worker creates its own Archive instance - no sharing needed
-    try:
-        archive = Archive(zim_path)
-    except Exception as e:
-        logging.error(f"Failed to open archive: {e}")
-        stats.update(errors=len(titles_batch))
-        return
-
-    batch_successful = 0
-    batch_redirects = 0
-    batch_errors = 0
-    batch_images = set()
+def process_batch(
+    zim_path: Path, titles_batch: List[str], valid_articles: Set[str]
+) -> Dict:
+    """Process a batch of titles in a single thread."""
+    archive = Archive(str(zim_path))
+    results = {"successful": 0, "redirects": 0, "errors": 0, "images": set()}
 
     for title in titles_batch:
         success, is_redirect, images = process_article(archive, title, valid_articles)
         if success:
             if is_redirect:
-                batch_redirects += 1
+                results["redirects"] += 1
             else:
-                batch_successful += 1
-                batch_images.update(images)
+                results["successful"] += 1
+                results["images"].update(images)
         else:
-            batch_errors += 1
+            results["errors"] += 1
 
-    # Update stats once per batch
-    stats.update(
-        successful=batch_successful,
-        redirects=batch_redirects,
-        errors=batch_errors,
-        images=batch_images,
-    )
+    return results
 
 
 def process_articles(
@@ -340,64 +268,51 @@ def process_articles(
     # Convert to set for O(1) lookup
     valid_articles = set(titles)
 
-    # Calculate optimal batch size
-    # Smaller batches = better progress reporting, larger = less overhead
-    batch_size = max(100, len(titles_to_process) // (max_workers * 10))
-    batch_size = min(batch_size, 500)  # Cap at 500 to maintain responsiveness
-
+    # Split into batches for parallel processing
+    batch_size = max(len(titles_to_process) // (max_workers * 4), 10)
     batches = [
         titles_to_process[i : i + batch_size]
         for i in range(0, len(titles_to_process), batch_size)
     ]
 
-    logging.info(
-        f"Processing {len(titles_to_process):,} articles in {len(batches)} batches of ~{batch_size} items using {max_workers} workers"
-    )
-
     start_time = time.time()
-    last_report_time = start_time
+    processed = 0
 
     # Process batches in parallel
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(
-                process_batch_worker, zim_path, batch, valid_articles, stats
-            )
+        futures = {
+            executor.submit(process_batch, zim_path, batch, valid_articles): batch
             for batch in batches
-        ]
+        }
 
-        completed = 0
         for future in as_completed(futures):
-            completed += 1
-
-            # Report progress every 2 seconds or every 10 batches
-            current_time = time.time()
-            if current_time - last_report_time >= 2.0 or completed % 10 == 0:
-                elapsed = current_time - start_time
-                processed = stats.total_processed
-                rate = processed / elapsed if elapsed > 0 else 0
-
-                logging.info(
-                    f"Progress: {processed:,}/{len(titles_to_process):,} "
-                    f"({processed / len(titles_to_process) * 100:.1f}%) "
-                    f"Rate: {rate:.1f}/sec - "
-                    f"Success: {stats.successful:,}, "
-                    f"Redirects: {stats.redirects:,}, "
-                    f"Errors: {stats.errors:,} "
-                    f"[Batches: {completed}/{len(batches)}]"
-                )
-                last_report_time = current_time
-
-            # Check for exceptions
             try:
-                future.result()
+                batch_results = future.result()
+                stats.successful += batch_results["successful"]
+                stats.redirects += batch_results["redirects"]
+                stats.errors += batch_results["errors"]
+                stats.images.update(batch_results["images"])
+
+                # Progress update
+                processed += len(futures[future])
+                if processed % 1000 < batch_size:
+                    elapsed = time.time() - start_time
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    logging.info(
+                        f"Progress: {processed:,}/{len(titles_to_process):,} "
+                        f"({rate:.1f}/sec) - "
+                        f"Success: {stats.successful:,}, "
+                        f"Redirects: {stats.redirects:,}, "
+                        f"Errors: {stats.errors:,}"
+                    )
             except Exception as e:
-                logging.error(f"Batch processing exception: {e}")
+                logging.error(f"Batch processing error: {e}")
+                stats.errors += len(futures[future])
 
     elapsed = time.time() - start_time
     logging.info(
         f"Processing complete in {elapsed:.1f}s "
-        f"({stats.total_processed / elapsed:.1f} articles/sec)"
+        f"({len(titles_to_process) / elapsed:.1f} articles/sec)"
     )
 
     return stats
@@ -411,20 +326,16 @@ def extract_images(zim_path: Path, image_names: Set[str], max_workers: int = 32)
     TARGET_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
     def extract_batch(image_batch):
-        """Extract a batch of images with its own Archive instance."""
-        try:
-            archive = Archive(zim_path)
-        except Exception as e:
-            logging.error(f"Failed to open archive for image extraction: {e}")
-            return 0
-
+        """Extract a batch of images."""
+        archive = Archive(str(zim_path))
         extracted = 0
+
         for image_name in image_batch:
             try:
                 entry = archive.get_entry_by_path(f"I/{image_name}")
+                content = bytes(entry.get_item().content)
                 output_path = TARGET_IMAGES_DIR / image_name
                 if not output_path.exists():
-                    content = bytes(entry.get_item().content)
                     output_path.write_bytes(content)
                     extracted += 1
             except Exception:
@@ -434,16 +345,13 @@ def extract_images(zim_path: Path, image_names: Set[str], max_workers: int = 32)
 
     # Split into batches
     image_list = list(image_names)
-    batch_size = max(100, len(image_list) // (max_workers * 10))
-    batch_size = min(batch_size, 500)
-
+    batch_size = max(len(image_list) // (max_workers * 4), 10)
     batches = [
         image_list[i : i + batch_size] for i in range(0, len(image_list), batch_size)
     ]
 
-    logging.info(f"Extracting images in {len(batches)} batches of ~{batch_size} items")
-
     total_extracted = 0
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(extract_batch, batch) for batch in batches]
         for future in as_completed(futures):

@@ -2,4 +2,11 @@ gwiki/
 topwiki/
 *.zim
 *.log
-A
+*.json
+A/
+Agtitles
+processing_results.json
+processing_summary.json
+B/
+test/
+I
